@@ -1,4 +1,5 @@
 import re
+import signal
 import sys
 import json
 import socket
@@ -30,6 +31,11 @@ def parse_command(command: str):
     return {"type": type, **dict(zip(arg_names, args))}
 
 
+def terminate_program():
+    print("Program terminated.")
+    sys.exit(0)
+
+
 def main():
     try:
         while True:
@@ -45,10 +51,11 @@ def main():
             except Exception as e:
                 print(e)
     except KeyboardInterrupt:
+        # to avoid printing ^C in the same line as the "Program terminated."
+        print("", flush=True)
         pass
 
-    print("Program terminated.")
-    sys.exit(0)
+    terminate_program()
 
 
 main()
