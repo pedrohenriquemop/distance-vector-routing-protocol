@@ -28,12 +28,12 @@ class Message:
         self.destination = destination
         self.type = type
 
-        def to_json(self) -> dict:
-            return {
-                "type": self.type,
-                "source": self.source,
-                "destination": self.destination,
-            }
+    def to_json(self) -> dict:
+        return {
+            "type": self.type,
+            "source": self.source,
+            "destination": self.destination,
+        }
 
 
 class DataMessage(Message):
@@ -71,7 +71,7 @@ class TraceMessage(Message):
 
 class CLICommand:
     def __init__(self, command: str):
-        self.type, *self.args = self.__parse_command(command)
+        self.type, self.args = self.__parse_command(command)
 
     def __parse_command(self, command: str):
         if not command:
@@ -93,7 +93,7 @@ class CLICommand:
         pattern = r"<(\w+)>"
         arg_names = re.findall(pattern, args_format)
 
-        return (type, *dict(zip(arg_names, args)))
+        return (type, dict(zip(arg_names, args)))
 
     def __str__(self):
         return str(self.__dict__)
@@ -115,6 +115,10 @@ class Router:
         self.last_update: dict[str, float] = {}
 
         self.lock = threading.Lock()
+
+        threading.Thread(target=self.listen, daemon=True).start()
+        threading.Thread(target=self.send_periodic_updates, daemon=True).start()
+        threading.Thread(target=self.cleanup_expired_routes, daemon=True).start()
 
     def listen(self):
         while True:
@@ -141,9 +145,6 @@ class Router:
             print(f"Unknown message type: {type}")
 
     def handle_update_message(self, msg: dict):
-        # LOG
-        print(f"Received update from {sender_ip}: {distances}")
-
         sender_ip = msg.get("source")
         if not sender_ip:
             return
@@ -152,30 +153,28 @@ class Router:
             self.last_update[sender_ip] = time.time()
 
             distances = msg.get("distances", {})
+            # LOG
+            print(f"Received update from {sender_ip}: {distances}")
+
+            cost_to_sender = self.neighbors.get(sender_ip)
+
+            if cost_to_sender is None:
+                return
+
             for dest, cost_from_sender in distances.items():
-                if dest not in self.routes or cost_from_sender < self.routes[dest][0]:
-                    if dest == self.ip:
-                        continue
+                if dest == self.ip:
+                    continue
 
-                    cost_to_sender = self.neighbors.get(sender_ip)
-                    if cost_to_sender is None:
-                        continue
+                total_cost = cost_from_sender + cost_to_sender
 
-                    total_cost = cost_from_sender + cost_to_sender
+                current_cost, current_next_hop = self.routes.get(
+                    dest, (float("inf"), None)
+                )
 
-                    is_dest_not_registered = dest not in self.routes
-                    is_cost_better = total_cost < self.routes.get(dest, (None, None))[0]
-                    has_sender_found_a_different_route = (
-                        self.routes.get(dest, (None, None))[1] == sender_ip
-                        and total_cost != self.routes.get(dest, (None, None))[0]
-                    )
-
-                    if (
-                        is_dest_not_registered
-                        or is_cost_better
-                        or has_sender_found_a_different_route
-                    ):
-                        self.routes[dest] = (total_cost, sender_ip)
+                if (total_cost < current_cost) or (
+                    current_next_hop == sender_ip and total_cost != current_cost
+                ):
+                    self.routes[dest] = (total_cost, sender_ip)
 
     def handle_trace_message(self, msg: dict):
         trace_routers = msg.get("routers", [])
@@ -183,9 +182,12 @@ class Router:
         msg["routers"] = trace_routers
 
         dest_ip = msg.get("destination")
+
+        # LOG
+        print(f"Received trace message from {msg['source']} to {dest_ip}")
         if dest_ip == self.ip:
             response = DataMessage(self.ip, msg["source"], msg).to_json()
-            self.send(response, msg["source"])
+            self.forward(response)
         else:
             self.forward(msg)
 
@@ -197,29 +199,43 @@ class Router:
             self.forward(msg)
 
     def forward(self, msg: dict):
-        with self.lock:
-            dest_ip = msg.get("destination")
-            if dest_ip in self.routes:
-                next_hop = self.routes[dest_ip][1]
-                if next_hop == self.ip and dest_ip != self.ip:
-                    if dest_ip in self.neighbors:
-                        # LOG
-                        print(f"Forwarding message to {dest_ip} via {next_hop}")
-                        self.send(msg, dest_ip)
-                    else:
-                        # LOG
-                        print(
-                            f"Cannot forward to {dest_ip}: invalid next hop {next_hop} for non-neighbor {dest_ip}"
-                        )
+        dest_ip = msg.get("destination")
+        if dest_ip in self.routes:
+            next_hop = self.routes[dest_ip][1]
 
-                else:
-                    # LOG
-                    print(f"Forwarding message to {dest_ip} via {next_hop}")
-                    self.send(msg, next_hop)
-            else:
+            if next_hop == self.ip:
+                print(
+                    f"Routing error: next hop for {dest_ip} is self ({self.ip}) but not destination."
+                )
+                return
+
+            if next_hop in self.neighbors:
                 # LOG
-                print(f"Destination {dest_ip} not reachable. Dropping message.")
-                # TODO: add control message logic
+                print(f"Forwarding message for {dest_ip} via next hop {next_hop}")
+                self.__send(msg, next_hop)
+            else:
+                print(
+                    f"Cannot forward to {dest_ip}: next hop {next_hop} is not a known neighbor."
+                )
+        else:
+            # LOG
+            print(f"Destination {dest_ip} not reachable. Dropping message.")
+            # TODO: add control message logic (for extra credit)
+
+    def __send(self, msg: dict, dest_ip: str):
+        data = json.dumps(msg).encode()
+
+        try:
+            if not dest_ip:
+                raise ValueError("Destination IP cannot be empty")
+
+            self.sock.sendto(data, (dest_ip, PORT))
+        except Exception as e:
+            print(f"Error sending message to {dest_ip}: {e}")
+
+    def trace(self, ip: str):
+        msg = TraceMessage(self.ip, ip, [self.ip])
+        self.forward(msg.to_json())
 
     def send_periodic_updates(self):
         while True:
@@ -237,17 +253,26 @@ class Router:
                         distances_to_advertise[self.ip] = 0
 
                     msg = UpdateMessage(self.ip, neighbor_ip, distances_to_advertise)
-                    self.send(msg.to_json(), neighbor_ip)
+                    self.forward(msg.to_json())
 
             time.sleep(self.period)
 
-    def send(self, msg: dict, dest_ip: str):
-        data = json.dumps(msg).encode()
+    def cleanup_expired_routes(self):
+        while True:
+            now = time.time()
+            with self.lock:
+                expired_neighbors = [
+                    neighbor
+                    for neighbor, last_ts in self.last_update.items()
+                    if now - last_ts > REMOVE_STALE_PERIOD_MULTIPLIER * self.period
+                    and neighbor in self.neighbors
+                ]
+                for ip in expired_neighbors:
+                    # LOG
+                    print(f"Stale neighbor {ip} removed")
+                    self.del_neighbor(ip)
 
-        try:
-            self.sock.sendto(data, (dest_ip, PORT))
-        except Exception as e:
-            print(f"Error sending message to {dest_ip}: {e}")
+            time.sleep(self.period)
 
     def startup(self, startup_file: str):
         try:
@@ -259,10 +284,11 @@ class Router:
                             parsed_command = CLICommand(line)
                             if parsed_command.type == "add":
                                 self.add_neighbor(
-                                    parsed_command.args[0], parsed_command.args[1]
+                                    parsed_command.args.get("ip"),
+                                    parsed_command.args.get("weight"),
                                 )
                             elif parsed_command.type == "del":
-                                self.del_neighbor(parsed_command.args[0])
+                                self.del_neighbor(parsed_command.args.get("ip"))
                         except Exception as e:
                             print(f"Error processing startup command '{line}': {e}")
         except FileNotFoundError:
@@ -303,27 +329,10 @@ class Router:
         except Exception as e:
             print(f"Error while trying to delete neighbor: {e}")
 
-    def cleanup_expired_routes(self):
-        while True:
-            now = time.time()
-            with self.lock:
-                expired_neighbors = [
-                    neighbor
-                    for neighbor, last_ts in self.last_update.items()
-                    if now - last_ts > REMOVE_STALE_PERIOD_MULTIPLIER * self.period
-                    and neighbor in self.neighbors
-                ]
-                for ip in expired_neighbors:
-                    # LOG
-                    print(f"Stale neighbor {ip} removed")
-                    self.del_neighbor(ip)
-
-            time.sleep(self.period)
-
     def run(self):
         try:
             while True:
-                command = input("$ ").strip().lower()
+                command = input().strip().lower()
 
                 if command == "quit":
                     print("Terminating router...")
@@ -331,8 +340,17 @@ class Router:
 
                 try:
                     parsed_command = CLICommand(command)
+                    type, args = parsed_command.type, parsed_command.args
 
-                    print(parsed_command)
+                    if type == "add":
+                        self.add_neighbor(args.get("ip"), int(args.get("weight")))
+
+                    elif type == "del":
+                        self.del_neighbor(args.get("ip"))
+
+                    elif type == "trace":
+                        self.trace(args.get("ip"))
+
                 except Exception as e:
                     print(f"Error executing command: {e}")
         except KeyboardInterrupt:
