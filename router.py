@@ -1,5 +1,4 @@
 import re
-import signal
 import sys
 import json
 import socket
@@ -7,6 +6,7 @@ import argparse
 import threading
 import time
 import logging
+import random
 
 PORT = 55151
 ACCEPTED_COMMANDS = {"add": "<ip> <weight>", "del": "<ip>", "trace": "<ip>"}
@@ -122,8 +122,9 @@ class Router:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.ip, PORT))
 
-        # Best know routes: {<dest>: (<cost>, <next_hop>)}
-        self.routes = {self.ip: (0, self.ip)}
+        # Best know routes: {<dest>: (<cost>, [<next_hop>])}
+        # List of next_hop's is used to implement load balancing
+        self.routes = {self.ip: (0, [self.ip])}
         # Adjacent routers: {<ip>: <weight>}
         self.neighbors: dict[str, int] = {}
         # Timestamp of the last received update from each neighbor: {<ip>: <timestamp>}
@@ -201,20 +202,28 @@ class Router:
 
                 total_cost = cost_from_sender + cost_to_sender
 
-                current_cost, current_next_hop = self.routes.get(
-                    dest, (float("inf"), None)
+                current_cost, current_next_hops = self.routes.get(
+                    dest, (float("inf"), [])
                 )
 
-                if (total_cost < current_cost) or (
-                    current_next_hop == sender_ip and total_cost != current_cost
-                ):
-                    self.routes[dest] = (total_cost, sender_ip)
+                if total_cost < current_cost:
+                    self.routes[dest] = (total_cost, [sender_ip])
                     router_logger.info(
                         f"[{self.ip}] Updated route to {dest}: Cost {total_cost} via {sender_ip}"
                     )
+                elif total_cost == current_cost and sender_ip not in current_next_hops:
+                    self.routes[dest][1].append(sender_ip)
+                    router_logger.info(
+                        f"[{self.ip}] Added equal-cost path to {dest}: Cost {total_cost} via {sender_ip}"
+                    )
+                elif sender_ip in current_next_hops and total_cost != current_cost:
+                    self.routes[dest] = (total_cost, [sender_ip])
+                    router_logger.info(
+                        f"[{self.ip}] Re-evaluated route to {dest}: Cost {total_cost} via {sender_ip} (same next_hop)"
+                    )
                 else:
                     router_logger.debug(
-                        f"[{self.ip}] No better route for {dest} via {sender_ip}. Current: {current_cost} via {current_next_hop}, Proposed: {total_cost} via {sender_ip}"
+                        f"[{self.ip}] No better route for {dest} via {sender_ip}. Current: {current_cost} via {current_next_hops}, Proposed: {total_cost} via {sender_ip}"
                     )
 
     def handle_trace_message(self, msg: dict):
@@ -266,7 +275,8 @@ class Router:
 
         with self.lock:
             if dest_ip in self.routes:
-                next_hop = self.routes[dest_ip][1]
+                possible_next_hops = self.routes[dest_ip][1]
+                next_hop = random.choice(possible_next_hops)
 
                 # If the next_hop is the router itself, it means the routing table
                 # incorrectly points back to self for a destination that is not self.
@@ -297,7 +307,10 @@ class Router:
                         router_logger.info(
                             f"[{self.ip}] Destination {dest_ip} not reachable. Sending control message back to {original_source}."
                         )
-                        next_hop_for_control = self.routes[original_source][1]
+                        possible_next_hops_for_control = self.routes[original_source][1]
+                        next_hop_for_control = random.choice(
+                            possible_next_hops_for_control
+                        )
                         self.__send(control_msg_obj.to_json(), next_hop_for_control)
                     else:
                         router_logger.warning(
@@ -340,8 +353,8 @@ class Router:
                     # Split Horizon: do not advertise routes learned from the neighbor back to it
                     distances_to_advertise = {
                         dest: cost
-                        for dest, (cost, next_hop) in self.routes.items()
-                        if next_hop != neighbor_ip
+                        for dest, (cost, next_hops) in self.routes.items()
+                        if neighbor_ip not in next_hops
                         and dest
                         != self.ip  # Do not advertise route to self, or routes learned from this neighbor
                     }
@@ -415,7 +428,7 @@ class Router:
 
             with self.lock:
                 self.neighbors[ip] = weight
-                self.routes[ip] = (weight, ip)
+                self.routes[ip] = (weight, [ip])
                 router_logger.info(
                     f"[{self.ip}] Added direct link to {ip} with weight {weight}"
                 )
@@ -431,14 +444,19 @@ class Router:
             with self.lock:
                 if ip in self.neighbors:
                     self.neighbors.pop(ip, None)
-                    # Remove all routes that were learned via this neighbor
-                    self.routes = {
-                        dist: (cost, next_hop)
-                        for dist, (cost, next_hop) in self.routes.items()
-                        if next_hop != ip
-                        and dist
-                        != ip  # Also remove the direct route to the neighbor itself
-                    }
+                    # Rebuild routes, removing the deleted neighbor from any next_hop lists
+                    new_routes = {}
+                    for dest, (cost, next_hops_list) in self.routes.items():
+                        if dest == ip:
+                            continue
+
+                        filtered_next_hops = [nh for nh in next_hops_list if nh != ip]
+
+                        if filtered_next_hops:
+                            new_routes[dest] = (cost, filtered_next_hops)
+
+                    self.routes = new_routes
+
                     self.last_update.pop(ip, None)
                     router_logger.info(
                         f"[{self.ip}] Removed direct link to {ip} and its associated routes."
