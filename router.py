@@ -73,6 +73,17 @@ class TraceMessage(Message):
         return msg
 
 
+class ControlMessage(Message):
+    def __init__(self, source: str, destination: str, unreachable: str):
+        super().__init__(source, destination, "control")
+        self.unreachable = unreachable
+
+    def to_json(self) -> dict:
+        msg = super().to_json()
+        msg["unreachable"] = self.unreachable
+        return msg
+
+
 class CLICommand:
     def __init__(self, command: str):
         self.type, self.args = self.__parse_command(command)
@@ -155,6 +166,8 @@ class Router:
             self.handle_trace_message(msg)
         elif msg_type == "data":
             self.handle_data_message(msg)
+        elif msg_type == "control":
+            self.handle_control_message(msg)
         else:
             router_logger.warning(f"[{self.ip}] Unknown message type: {msg_type}")
 
@@ -237,9 +250,19 @@ class Router:
             )
             self.forward(msg)
 
-    def forward(self, msg: dict):
-
+    def handle_control_message(self, msg: dict):
         dest_ip = msg.get("destination")
+        if dest_ip == self.ip:
+            router_logger.info(f"[{self.ip}] {msg.get('unreachable')} is unreachable.")
+        else:
+            router_logger.debug(
+                f"[{self.ip}] Control message not for self, forwarding to {dest_ip}."
+            )
+            self.forward(msg)
+
+    def forward(self, msg: dict):
+        dest_ip = msg.get("destination")
+        msg_type = msg.get("type")
 
         with self.lock:
             if dest_ip in self.routes:
@@ -264,10 +287,26 @@ class Router:
                         f"[{self.ip}] Cannot forward to {dest_ip}: next hop {next_hop} is not a known neighbor. Dropping."
                     )
             else:
-                router_logger.info(
-                    f"[{self.ip}] Destination {dest_ip} not reachable. Dropping message."
-                )
-                # TODO: add control message logic for extra credit
+                if msg_type != "control":
+                    original_source = msg["source"]
+
+                    if original_source in self.routes:
+                        control_msg_obj = ControlMessage(
+                            self.ip, original_source, dest_ip
+                        )
+                        router_logger.info(
+                            f"[{self.ip}] Destination {dest_ip} not reachable. Sending control message back to {original_source}."
+                        )
+                        next_hop_for_control = self.routes[original_source][1]
+                        self.__send(control_msg_obj.to_json(), next_hop_for_control)
+                    else:
+                        router_logger.warning(
+                            f"[{self.ip}] Destination {dest_ip} unreachable, but original source {original_source} is also unreachable by this router. Dropping control message."
+                        )
+                else:
+                    router_logger.warning(
+                        f"[{self.ip}] Received control message for unreachable destination {dest_ip}. Cannot forward. Dropping to prevent loop."
+                    )
 
     def __send(self, msg: dict, next_hop_ip: str):
         data = json.dumps(msg).encode()
