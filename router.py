@@ -6,11 +6,15 @@ import socket
 import argparse
 import threading
 import time
+import logging
 
 PORT = 55151
 ACCEPTED_COMMANDS = {"add": "<ip> <weight>", "del": "<ip>", "trace": "<ip>"}
 REMOVE_STALE_PERIOD_MULTIPLIER = 4
-BUFFER_SIZE = 65536  # 2 bytes
+BUFFER_SIZE = 65536
+
+router_logger = logging.getLogger("router_app")
+router_logger.propagate = False
 
 
 class Utils:
@@ -88,7 +92,7 @@ class CLICommand:
         expected_args_len = len(args_format.split(" "))
 
         if expected_args_len != len(args):
-            raise Exception(f"Usage: {args_format}")
+            raise Exception(f"Usage: {type} {args_format}")  # Corrected usage string
 
         pattern = r"<(\w+)>"
         arg_names = re.findall(pattern, args_format)
@@ -120,45 +124,62 @@ class Router:
         threading.Thread(target=self.send_periodic_updates, daemon=True).start()
         threading.Thread(target=self.cleanup_expired_routes, daemon=True).start()
 
+        router_logger.info(
+            f"Router {self.ip} started with update period {self.period}s"
+        )
+
     def listen(self):
         while True:
             try:
                 data, addr = self.sock.recvfrom(BUFFER_SIZE)
                 msg = json.loads(data.decode())
+                router_logger.debug(
+                    f"[{self.ip}] Received raw message from {addr}: {msg}"
+                )
                 self.handle_message(msg)
 
             except json.JSONDecodeError:
-                print(f"Received malformed JSON from {addr}")
+                router_logger.warning(
+                    f"[{self.ip}] Received malformed JSON from {addr}"
+                )
             except Exception as e:
-                print(f"Error receiving/handling message: {e}")
+                router_logger.error(
+                    f"[{self.ip}] Error receiving/handling message: {e}", exc_info=True
+                )
 
     def handle_message(self, msg: dict):
-        type = msg.get("type")
-        if type == "update":
+        msg_type = msg.get("type")
+        if msg_type == "update":
             self.handle_update_message(msg)
-        elif type == "trace":
+        elif msg_type == "trace":
             self.handle_trace_message(msg)
-        elif type == "data":
+        elif msg_type == "data":
             self.handle_data_message(msg)
         else:
-            # LOG
-            print(f"Unknown message type: {type}")
+            router_logger.warning(f"[{self.ip}] Unknown message type: {msg_type}")
 
     def handle_update_message(self, msg: dict):
         sender_ip = msg.get("source")
         if not sender_ip:
+            router_logger.warning(
+                f"[{self.ip}] Received update message with no source IP: {msg}"
+            )
             return
 
         with self.lock:
             self.last_update[sender_ip] = time.time()
 
             distances = msg.get("distances", {})
-            # LOG
-            print(f"Received update from {sender_ip}: {distances}")
+            router_logger.debug(
+                f"[{self.ip}] Received update from {sender_ip}: {distances}"
+            )
 
             cost_to_sender = self.neighbors.get(sender_ip)
 
             if cost_to_sender is None:
+                router_logger.debug(
+                    f"[{self.ip}] Ignoring update from {sender_ip}: not a direct neighbor."
+                )
                 return
 
             for dest, cost_from_sender in distances.items():
@@ -175,6 +196,13 @@ class Router:
                     current_next_hop == sender_ip and total_cost != current_cost
                 ):
                     self.routes[dest] = (total_cost, sender_ip)
+                    router_logger.info(
+                        f"[{self.ip}] Updated route to {dest}: Cost {total_cost} via {sender_ip}"
+                    )
+                else:
+                    router_logger.debug(
+                        f"[{self.ip}] No better route for {dest} via {sender_ip}. Current: {current_cost} via {current_next_hop}, Proposed: {total_cost} via {sender_ip}"
+                    )
 
     def handle_trace_message(self, msg: dict):
         trace_routers = msg.get("routers", [])
@@ -183,58 +211,87 @@ class Router:
 
         dest_ip = msg.get("destination")
 
-        # LOG
-        print(f"Received trace message from {msg['source']} to {dest_ip}")
+        router_logger.info(
+            f"[{self.ip}] Received trace message from {msg['source']} to {dest_ip}. Path: {msg['routers']}"
+        )
         if dest_ip == self.ip:
             response = DataMessage(self.ip, msg["source"], msg).to_json()
+            router_logger.debug(
+                f"[{self.ip}] Trace destination reached. Sending response to {msg['source']}."
+            )
             self.forward(response)
         else:
+            router_logger.debug(f"[{self.ip}] Trace message not for self, forwarding.")
             self.forward(msg)
 
     def handle_data_message(self, msg: dict):
         dest_ip = msg.get("destination")
         if dest_ip == self.ip:
             print(msg.get("payload"))
+            router_logger.info(
+                f"[{self.ip}] Delivered data message for self. Payload printed."
+            )
         else:
+            router_logger.debug(
+                f"[{self.ip}] Data message not for self, forwarding to {dest_ip}."
+            )
             self.forward(msg)
 
     def forward(self, msg: dict):
+
         dest_ip = msg.get("destination")
-        if dest_ip in self.routes:
-            next_hop = self.routes[dest_ip][1]
 
-            if next_hop == self.ip:
-                print(
-                    f"Routing error: next hop for {dest_ip} is self ({self.ip}) but not destination."
-                )
-                return
+        with self.lock:
+            if dest_ip in self.routes:
+                next_hop = self.routes[dest_ip][1]
 
-            if next_hop in self.neighbors:
-                # LOG
-                print(f"Forwarding message for {dest_ip} via next hop {next_hop}")
-                self.__send(msg, next_hop)
+                # If the next_hop is the router itself, it means the routing table
+                # incorrectly points back to self for a destination that is not self.
+                # This indicates a routing loop or error in route calculation.
+                if next_hop == self.ip and dest_ip != self.ip:
+                    router_logger.error(
+                        f"[{self.ip}] Routing error: next hop for {dest_ip} is self ({self.ip}) but it's not the destination. Dropping."
+                    )
+                    return
+
+                if next_hop in self.neighbors:
+                    router_logger.debug(
+                        f"[{self.ip}] Forwarding message for {dest_ip} via next hop {next_hop}"
+                    )
+                    self.__send(msg, next_hop)
+                else:
+                    router_logger.warning(
+                        f"[{self.ip}] Cannot forward to {dest_ip}: next hop {next_hop} is not a known neighbor. Dropping."
+                    )
             else:
-                print(
-                    f"Cannot forward to {dest_ip}: next hop {next_hop} is not a known neighbor."
+                router_logger.info(
+                    f"[{self.ip}] Destination {dest_ip} not reachable. Dropping message."
                 )
-        else:
-            # LOG
-            print(f"Destination {dest_ip} not reachable. Dropping message.")
-            # TODO: add control message logic (for extra credit)
+                # TODO: add control message logic for extra credit
 
-    def __send(self, msg: dict, dest_ip: str):
+    def __send(self, msg: dict, next_hop_ip: str):
         data = json.dumps(msg).encode()
 
         try:
-            if not dest_ip:
-                raise ValueError("Destination IP cannot be empty")
+            if not next_hop_ip:
+                router_logger.error(
+                    f"[{self.ip}] Attempted to send with empty next hop IP."
+                )
+                raise ValueError("Next hop IP cannot be empty")
 
-            self.sock.sendto(data, (dest_ip, PORT))
+            self.sock.sendto(data, (next_hop_ip, PORT))
+            router_logger.debug(
+                f"[{self.ip}] Successfully sent message (type: {msg.get('type')}) to {next_hop_ip}"
+            )
         except Exception as e:
-            print(f"Error sending message to {dest_ip}: {e}")
+            router_logger.error(
+                f"[{self.ip}] Error sending UDP packet to {next_hop_ip}: {e}",
+                exc_info=True,
+            )
 
     def trace(self, ip: str):
         msg = TraceMessage(self.ip, ip, [self.ip])
+        router_logger.info(f"[{self.ip}] CLI: Initiating trace to {ip}.")
         self.forward(msg.to_json())
 
     def send_periodic_updates(self):
@@ -242,18 +299,23 @@ class Router:
             with self.lock:
                 for neighbor_ip in self.neighbors:
                     # Split Horizon: do not advertise routes learned from the neighbor back to it
-                    # i.e.: do not advertise neighbor if the route already passes through it
                     distances_to_advertise = {
                         dest: cost
                         for dest, (cost, next_hop) in self.routes.items()
-                        if next_hop != neighbor_ip and dest != self.ip
+                        if next_hop != neighbor_ip
+                        and dest
+                        != self.ip  # Do not advertise route to self, or routes learned from this neighbor
                     }
 
+                    # Always advertise the direct route to self with cost 0, for neighbors to learn how to reach me.
                     if self.ip not in distances_to_advertise:
                         distances_to_advertise[self.ip] = 0
 
                     msg = UpdateMessage(self.ip, neighbor_ip, distances_to_advertise)
-                    self.forward(msg.to_json())
+                    router_logger.debug(
+                        f"[{self.ip}] Sending update to {neighbor_ip}: {distances_to_advertise}"
+                    )
+                    self.__send(msg.to_json(), neighbor_ip)
 
             time.sleep(self.period)
 
@@ -268,8 +330,9 @@ class Router:
                     and neighbor in self.neighbors
                 ]
                 for ip in expired_neighbors:
-                    # LOG
-                    print(f"Stale neighbor {ip} removed")
+                    router_logger.info(
+                        f"[{self.ip}] Stale neighbor {ip} detected (no updates for >{REMOVE_STALE_PERIOD_MULTIPLIER * self.period}s). Removing routes."
+                    )
                     self.del_neighbor(ip)
 
             time.sleep(self.period)
@@ -277,6 +340,9 @@ class Router:
     def startup(self, startup_file: str):
         try:
             with open(startup_file, "r") as f:
+                router_logger.info(
+                    f"[{self.ip}] Processing startup file: {startup_file}"
+                )
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#"):
@@ -285,49 +351,68 @@ class Router:
                             if parsed_command.type == "add":
                                 self.add_neighbor(
                                     parsed_command.args.get("ip"),
-                                    parsed_command.args.get("weight"),
+                                    int(parsed_command.args.get("weight")),
                                 )
                             elif parsed_command.type == "del":
                                 self.del_neighbor(parsed_command.args.get("ip"))
+                            router_logger.debug(
+                                f"[{self.ip}] Executed startup command: {line}"
+                            )
                         except Exception as e:
-                            print(f"Error processing startup command '{line}': {e}")
+                            router_logger.error(
+                                f"[{self.ip}] Error processing startup command '{line}': {e}",
+                                exc_info=True,
+                            )
         except FileNotFoundError:
-            print(f"Startup file not found: {startup_file}")
+            router_logger.critical(
+                f"[{self.ip}] Startup file not found: {startup_file}. Exiting."
+            )
             sys.exit(1)
 
-    def add_neighbor(self, ip: str, weight: int | str):
+    def add_neighbor(self, ip: str, weight: int):
         try:
-            w = int(weight)
-            if w < 0:
+            if weight < 0:
                 raise ValueError("Weight must be non-negative")
 
             with self.lock:
-                self.neighbors[ip] = w
-
-                self.routes[ip] = (w, ip)
-                # LOG
-                print(f"Added link to {ip} with weight {w}")
+                self.neighbors[ip] = weight
+                self.routes[ip] = (weight, ip)
+                router_logger.info(
+                    f"[{self.ip}] Added direct link to {ip} with weight {weight}"
+                )
         except ValueError as e:
-            print(f"Invalid weight: {e}")
+            router_logger.error(f"[{self.ip}] Invalid weight for {ip}: {e}")
+        except Exception as e:
+            router_logger.error(
+                f"[{self.ip}] Error adding neighbor {ip}: {e}", exc_info=True
+            )
 
     def del_neighbor(self, ip: str):
         try:
             with self.lock:
                 if ip in self.neighbors:
                     self.neighbors.pop(ip, None)
+                    # Remove all routes that were learned via this neighbor
                     self.routes = {
                         dist: (cost, next_hop)
                         for dist, (cost, next_hop) in self.routes.items()
                         if next_hop != ip
+                        and dist
+                        != ip  # Also remove the direct route to the neighbor itself
                     }
                     self.last_update.pop(ip, None)
-                    # LOG
-                    print(f"Removed link to {ip} and its associated routes")
+                    router_logger.info(
+                        f"[{self.ip}] Removed direct link to {ip} and its associated routes."
+                    )
                 else:
-                    # LOG
-                    print(f"No neighbor with ip {ip} to delete")
+                    router_logger.warning(
+                        f"[{self.ip}] No direct link to {ip} to delete."
+                    )
         except Exception as e:
-            print(f"Error while trying to delete neighbor: {e}")
+            router_logger.error(
+                f"[{self.ip}] Error while trying to delete neighbor {ip}: {e}",
+                exc_info=True,
+            )
 
     def run(self):
         try:
@@ -335,43 +420,72 @@ class Router:
                 command = input().strip().lower()
 
                 if command == "quit":
-                    print("Terminating router...")
+                    router_logger.info(
+                        f"[{self.ip}] CLI: Terminating router by user command."
+                    )
                     break
 
                 try:
                     parsed_command = CLICommand(command)
-                    type, args = parsed_command.type, parsed_command.args
+                    cmd_type, args = parsed_command.type, parsed_command.args
 
-                    if type == "add":
+                    if cmd_type == "add":
                         self.add_neighbor(args.get("ip"), int(args.get("weight")))
 
-                    elif type == "del":
+                    elif cmd_type == "del":
                         self.del_neighbor(args.get("ip"))
 
-                    elif type == "trace":
+                    elif cmd_type == "trace":
                         self.trace(args.get("ip"))
 
                 except Exception as e:
-                    print(f"Error executing command: {e}")
+                    router_logger.error(
+                        f"[{self.ip}] Error executing CLI command '{command}': {e}",
+                        exc_info=True,
+                    )
         except KeyboardInterrupt:
-            print("\nTerminating router...")
+            router_logger.info(
+                f"[{self.ip}] Terminating router by KeyboardInterrupt (Ctrl+C)."
+            )
+        finally:
+            self.sock.close()
+            router_logger.info(f"[{self.ip}] Router socket closed. Exiting.")
 
 
 def terminate_program():
-    print("Program terminated.")
+    router_logger.info("Program terminated cleanly.")
     sys.exit(0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Router emulator CLI")
-
+    parser = argparse.ArgumentParser(description="UDPRIP Router Emulator")
     parser.add_argument("ip_address", help="IP address on which the router will bind")
-    parser.add_argument("period", help="Update period in seconds")
+    parser.add_argument("period", type=float, help="Update period in seconds (π)")
     parser.add_argument("startup", help="Startup file (optional)", nargs="?")
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable debug logging output to console."
+    )
 
     args = parser.parse_args()
 
-    router = Router(args.ip_address, float(args.period))
+    for handler in router_logger.handlers[:]:
+        router_logger.removeHandler(handler)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - [%(ip)s] %(message)s"
+    )
+    console_handler.setFormatter(formatter)
+
+    if args.debug:
+        router_logger.addHandler(console_handler)
+        router_logger.setLevel(logging.DEBUG)
+        router_logger.debug(f"Debug logging enabled for router {args.ip_address}.")
+    else:
+        router_logger.setLevel(logging.CRITICAL)
+        router_logger.addHandler(logging.NullHandler())
+
+    router = Router(args.ip_address, args.period)
 
     if args.startup:
         router.startup(args.startup)
@@ -381,4 +495,5 @@ def main():
     terminate_program()
 
 
-main()
+if __name__ == "__main__":
+    main()
