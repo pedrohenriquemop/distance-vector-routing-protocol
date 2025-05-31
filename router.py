@@ -103,7 +103,7 @@ class CLICommand:
         expected_args_len = len(args_format.split(" "))
 
         if expected_args_len != len(args):
-            raise Exception(f"Usage: {type} {args_format}")  # Corrected usage string
+            raise Exception(f"Usage: {type} {args_format}")
 
         pattern = r"<(\w+)>"
         arg_names = re.findall(pattern, args_format)
