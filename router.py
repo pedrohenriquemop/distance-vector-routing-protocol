@@ -12,6 +12,7 @@ PORT = 55151
 ACCEPTED_COMMANDS = {"add": "<ip> <weight>", "del": "<ip>", "trace": "<ip>"}
 REMOVE_STALE_PERIOD_MULTIPLIER = 4
 BUFFER_SIZE = 65536
+MAX_HOPS = 16
 
 router_logger = logging.getLogger("router_app")
 router_logger.propagate = False
@@ -31,12 +32,14 @@ class Message:
         self.source = source
         self.destination = destination
         self.type = type
+        self.hop_count = 0
 
     def to_json(self) -> dict:
         return {
             "type": self.type,
             "source": self.source,
             "destination": self.destination,
+            "hop_count": self.hop_count,
         }
 
 
@@ -63,13 +66,13 @@ class UpdateMessage(Message):
 
 
 class TraceMessage(Message):
-    def __init__(self, source: str, destination: str, routers: list[str]):
+    def __init__(self, source: str, destination: str, hops: list[str]):
         super().__init__(source, destination, "trace")
-        self.routers = routers
+        self.hops = hops
 
     def to_json(self) -> dict:
         msg = super().to_json()
-        msg["routers"] = self.routers
+        msg["hops"] = self.hops
         return msg
 
 
@@ -227,16 +230,17 @@ class Router:
                     )
 
     def handle_trace_message(self, msg: dict):
-        trace_routers = msg.get("routers", [])
-        trace_routers.append(self.ip)
-        msg["routers"] = trace_routers
+        trace_hops = msg.get("hops", [])
+        trace_hops.append(self.ip)
+        msg["hops"] = trace_hops
 
         dest_ip = msg.get("destination")
 
         router_logger.info(
-            f"[{self.ip}] Received trace message from {msg['source']} to {dest_ip}. Path: {msg['routers']}"
+            f"[{self.ip}] Received trace message from {msg['source']} to {dest_ip}. Path: {msg['hops']}"
         )
         if dest_ip == self.ip:
+            msg.pop("hop_count", None)
             response = DataMessage(self.ip, msg["source"], msg).to_json()
             router_logger.debug(
                 f"[{self.ip}] Trace destination reached. Sending response to {msg['source']}."
@@ -272,6 +276,16 @@ class Router:
     def forward(self, msg: dict):
         dest_ip = msg.get("destination")
         msg_type = msg.get("type")
+
+        current_hop_count = msg.get("hop_count", 0)
+
+        current_hop_count += 1
+
+        if current_hop_count > MAX_HOPS:
+            router_logger.warning(
+                f"[{self.ip}] Dropping {msg_type} message for {dest_ip}: max hops ({MAX_HOPS}) exceeded. Current hops: {current_hop_count}"
+            )
+            return
 
         with self.lock:
             if dest_ip in self.routes:
